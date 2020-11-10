@@ -1,0 +1,428 @@
+---
+title: "Analysis Kidney Transplant Samples"
+output: html_notebook
+---
+
+```{r message=FALSE}
+library(readxl)
+library(dplyr)
+library(ggplot2)
+library(reshape)
+library(pheatmap)
+library(gridExtra)
+library(grid)
+library(cowplot)
+library(ggrepel)
+library(hexbin)
+library(readr)
+library(vsn)
+library(limma)
+library(progeny)
+library(tibble)
+library(dorothea)
+library(staplr)
+source("support_functions.R")
+```
+
+```{r}
+# Load xlsl file, skip metadata header
+df <- read_excel("../data/data.xlsx", skip = 1, col_names = FALSE)[,1:25]
+
+meta <- df[1:6,1:25] %>% t()
+colnames(meta) <- meta[1,]
+meta <- meta[-1,] #Remove rownames
+meta <- meta %>% as_tibble() %>% select(pair, treatment, condition)
+# Format changes
+meta <- meta %>% 
+  mutate(pair=toupper(pair), 
+         treatment=ifelse(treatment == 'Baseline', 'BT', 'AT'),
+         condition=ifelse(condition == 'Kontroll', 'CN', 'IN')) %>%
+  tidyr::unite(sample, condition, treatment, pair, sep = "_", remove = FALSE)
+
+# Remove header from table
+df <- df[8:nrow(df),]
+
+# Select gene ids and remove column
+gene_ids <- df['...1'] %>% t()
+df <- df[,-1]
+
+# Transform to numeric df
+df <- data.frame(sapply(df, function(x) as.numeric(x)))
+
+# Name cols and rows
+rownames(df) <- gene_ids
+colnames(df) <- meta$sample
+
+#We remove rows that contain only 0
+df <- df[rowSums(df) > 0,]
+#remaining 0 have to be made as NA so that log2 transformation is possible
+df[df == 0] <- NA
+```
+
+```{r}
+run_normalize <- function(tdf, condition, dir){
+  # Generate targets data-frame
+  targets <- as.data.frame(matrix(NA,length(names(tdf)),2))
+  names(targets) <- c("sample","condition")
+  targets$sample <- names(tdf)
+  targets$condition <- condition
+  
+  # Trim violin plots
+  tdf[log2(tdf) < 4 ] <- NA
+  
+  # Remove rows (genes) which aren't well-measured in enough samples
+  tdf <- tdf[rowSums(is.na(tdf)) < 2,]
+  
+  #now we can normalise the cleaned dataframe using vsn
+  fit <- vsnMatrix(as.matrix(tdf)) #train vsn parameters
+  count_df_vsn <- as.data.frame(vsn::predict(fit,as.matrix(tdf)))
+  
+  # Plot results
+  plots <- magicPlotMakerLight(df = count_df_vsn, targets = targets)
+  
+  # Transform gene ids to gene symbols
+  path <- file.path("..", "data")
+  gene_id_symbol <- 
+    read.csv(file.path(path, "gene_id_symbol.csv"), header = TRUE)
+  rownames(gene_id_symbol) <- gene_id_symbol$id
+  
+  #remove all genes that have no gene symbol from our count dataframe
+  count_df_vsn <- count_df_vsn[row.names(count_df_vsn) %in% 
+                                 rownames(gene_id_symbol),]
+  gene_id_symbol <- gene_id_symbol[rownames(gene_id_symbol) %in% 
+                                     row.names(count_df_vsn),]
+  
+  # Mean duplicates
+  repeated_symbols <- gene_id_symbol %>% group_by(symbol) %>% 
+    summarise(count=n()) %>% arrange(desc(count)) %>% filter(count > 1) %>% 
+    select(symbol) %>% t() %>% unname() %>% c()
+  
+  for(r in repeated_symbols){
+    # Get repeated ids
+    repeated_ids <- gene_id_symbol %>% 
+      filter(symbol==r) %>% rownames()
+    # Compute mean expression
+    mean_r <- count_df_vsn[repeated_ids,] %>% 
+      summarise(across(everything(), list(mean)))
+    # Update symbol with mean expression
+    count_df_vsn[r,] <- mean_r
+    
+    # Remove ids
+    count_df_vsn <- count_df_vsn[!row.names(count_df_vsn) %in% repeated_ids,]
+  }
+  
+  #now let's convert ids with the pseudo dictionary
+  for(i in 1:length(count_df_vsn[,1]))
+  {
+    if (!row.names(count_df_vsn)[i] %in% repeated_symbols){
+      row.names(count_df_vsn)[i] <- 
+        gene_id_symbol[row.names(count_df_vsn)[i],]$symbol
+    }
+  }
+  
+  to_write <- count_df_vsn
+  to_write$gene <- row.names(to_write)
+  to_write <- to_write[,c(length(to_write[1,]),1:(length(to_write[1,])-1))]
+  
+  # Create dir where to store results
+  path <- file.path("..", "results", dir)
+  dir.create(path, showWarnings = FALSE)
+  write_csv(to_write, file.path(path, "count_df_vsn.csv"))
+  write_csv(targets, file.path(path, "targets.csv"))
+  pdf(file.path(path, "normalization.pdf"), onefile = TRUE)
+  print(plot.new() + text(.5, .5, 'Normalization', cex=3))
+  text(.5, .5, 'Normalization', cex=3)
+  for (i in seq(length(plots))){
+    plot(plots[[i]])
+  }
+  meanSdPlot(fit)
+  dev.off()
+}
+
+run_de <- function(dir){
+  path <- file.path("..", "results", dir)
+  
+  count_df_vsn <- as.data.frame(read_csv(file.path(path, "count_df_vsn.csv")))
+  row.names(count_df_vsn) <- count_df_vsn[,1]
+  count_df_vsn <- count_df_vsn[,-1]
+  #Design
+  targets <- as.data.frame(read_csv(file.path(path, "targets.csv")))
+  
+  
+  # We want to compare the KO condition with the WT condition so we build a
+  # Comparison list
+  # Each vector of the list represent the contrasts, here we subtract the 
+  # first condition (-1) from the second one (2)
+  comparisons <- list("WTvsKO" = c(2,-1))
+  
+  # Now that the comparisons are defined, we can run limma
+  limmaRes <- runLimma(measurements = count_df_vsn, 
+                       targets = targets, 
+                       comparisons = comparisons)
+  
+  #once limma has run, we extract the statistics dataframe to summarise the
+  #differential analysis
+  ttop_de <- ttopFormatter(topTable(limmaRes[[1]], coef = 1, 
+                                    number = length(count_df_vsn[,1]), 
+                                    adjust.method = "fdr"))
+  
+  #make a qqplot
+  pdf(file.path(path, "DE.pdf"), onefile = TRUE)
+  print(plot.new() + text(.5, .5, 'DE analysis', cex=3))
+  null_model <- pnorm(rnorm(length(ttop_de[,1])))
+  plot(sort(null_model), sort(ttop_de$P.Value) ,xlim = c(1,0),
+       ylim = c(1,0)) 
+  abline(coef = c(0,1))
+  print(volcano_nice(as.data.frame(ttop_de), 
+      FCIndex = 2, pValIndex = 5, IDIndex = 1,nlabels = 20, label = TRUE, 
+      straight = FALSE))
+  dev.off()
+  # Write de genes to file
+  write_csv(ttop_de, file.path(path, "ttop_de.csv"))
+}
+
+run_pathway <- function(dir){
+  path <- file.path("..", "results", dir)
+  
+  ## We read the normalised counts and the experimental design 
+  Normalised_counts <- read_csv(file.path(path, "count_df_vsn.csv"))
+  Experimental_design <- read_csv(file.path(path, "targets.csv"))
+  
+  ## We read the results from the differential analysis. 
+  ttop_de <- read_csv(file.path(path, "ttop_de.csv"))
+  
+  Normalised_counts_matrix <- Normalised_counts %>% 
+      dplyr::mutate_if(~ any(is.na(.x)),~ if_else(is.na(.x),0,.x)) %>% 
+      tibble::column_to_rownames(var = "gene") %>% 
+      as.matrix()
+  
+  ttop_de_matrix <- ttop_de %>% 
+      dplyr::select(ID, t) %>% 
+      dplyr::filter(!is.na(t)) %>% 
+      column_to_rownames(var = "ID") %>%
+      as.matrix()
+  
+  PathwayActivity_counts <- progeny(Normalised_counts_matrix, scale=TRUE, 
+      organism="Human", top = 100)
+  Activity_counts <- as.vector(PathwayActivity_counts)
+  
+  paletteLength <- 100
+  myColor <- 
+      colorRampPalette(c("darkblue", "whitesmoke","indianred"))(paletteLength)
+  
+  progenyBreaks <- c(seq(min(Activity_counts), 0, 
+      length.out=ceiling(paletteLength/2) + 1),
+      seq(max(Activity_counts)/paletteLength, 
+      max(Activity_counts), 
+      length.out=floor(paletteLength/2)))
+  
+  PathwayActivity_zscore <- progeny(ttop_de_matrix, 
+      scale=TRUE, organism="Human", top = 100, perm = 10000, z_scores = TRUE) %>%
+      t()
+  colnames(PathwayActivity_zscore) <- "NES"
+  
+  PathwayActivity_zscore_df <- as.data.frame(PathwayActivity_zscore) %>% 
+      rownames_to_column(var = "Pathway") %>%
+      dplyr::arrange(NES) %>%
+      dplyr::mutate(Pathway = factor(Pathway))
+  
+  prog_matrix <- getModel("Human", top=100) %>% 
+      as.data.frame()  %>%
+      tibble::rownames_to_column("GeneID")
+  
+  ttop_de_df <- ttop_de_matrix %>% 
+      as.data.frame() %>% 
+      tibble::rownames_to_column("GeneID")
+  
+  scat_plots <- progeny::progenyScatter(df = ttop_de_df, 
+      weight_matrix = prog_matrix, 
+      statName = "t_values", verbose = FALSE)
+  
+  top_path <- PathwayActivity_zscore_df %>% sort_df(vars='NES') %>% 
+    purrr::map_df(rev) %>% select(Pathway) %>% head(3) %>% c() %>% unlist()
+  
+  pdf(file.path(path, "pathway.pdf"), onefile = TRUE)
+  print(plot.new() + text(.5, .5, 'Pathway analysis', cex=3))
+  print(pheatmap(t(PathwayActivity_counts),fontsize=14, 
+      fontsize_row = 10, fontsize_col = 10, 
+      color=myColor, breaks = progenyBreaks, 
+      main = "PROGENy (100)", angle_col = 45,
+      treeheight_col = 0,  border_color = NA))
+  print(ggplot(PathwayActivity_zscore_df,aes(x = reorder(Pathway, NES), y = NES)) + 
+    geom_bar(aes(fill = NES), stat = "identity") +
+    scale_fill_gradient2(low = "darkblue", high = "indianred", 
+        mid = "whitesmoke", midpoint = 0) + 
+    theme_minimal() +
+    theme(axis.title = element_text(face = "bold", size = 12),
+        axis.text.x = 
+            element_text(angle = 45, hjust = 1, size =10, face= "bold"),
+        axis.text.y = element_text(size =10, face= "bold"),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank()) +
+    xlab("Pathways"))
+  
+  for (i in top_path) {
+    if (i == 'JAK.STAT') {
+      i = 'JAK-STAT'
+    }
+    plot(scat_plots[[1]][[i]])
+  }
+  dev.off()
+}
+
+run_tf <- function(dir){
+
+  path <- file.path("..", "results", dir)
+    
+  ## We read the normalised counts and the experimental design 
+  Normalised_counts <- read_csv(file.path(path, "count_df_vsn.csv"))
+  Experimental_design <- read_csv(file.path(path, "targets.csv"))
+  
+  ## We read the results from the differential analysis. 
+  ttop_de <- read_csv(file.path(path, "ttop_de.csv"))
+  
+  Normalised_counts_matrix <- Normalised_counts %>% 
+      dplyr::mutate_if(~ any(is.na(.x)),~ if_else(is.na(.x),0,.x)) %>% 
+      tibble::column_to_rownames(var = "gene") %>% 
+      as.matrix()
+  
+  ttop_de_matrix <- ttop_de %>% 
+      dplyr::select(ID, t) %>% 
+      dplyr::filter(!is.na(t)) %>% 
+      column_to_rownames(var = "ID") %>%
+      as.matrix()
+  
+  ## We load Dorothea Regulons
+  data(dorothea_hs, package = "dorothea")
+  regulons <- dorothea_hs %>%
+    dplyr::filter(confidence %in% c("A", "B","C"))
+  
+  tf_activities_stat <- dorothea::run_viper(ttop_de_matrix, regulons,
+      options =  list(minsize = 5, eset.filter = FALSE, 
+      cores = 1, verbose = FALSE, nes = TRUE))
+  
+  tf_activities_stat_top25 <- tf_activities_stat %>%
+      as.data.frame() %>% 
+      rownames_to_column(var = "GeneID") %>%
+      dplyr::rename(NES = "t") %>%
+      dplyr::top_n(25, wt = abs(NES)) %>%
+      dplyr::arrange(NES) %>% 
+      dplyr::mutate(GeneID = factor(GeneID))
+  
+  max_tf <- tf_activities_stat_top25 %>% filter(NES==max(NES))
+  targets_tf_max <- regulons$target[regulons$tf == max_tf$GeneID]
+  
+  
+  min_tf <- tf_activities_stat_top25 %>% filter(NES==min(NES))
+  targets_tf_min <- regulons$target[regulons$tf == min_tf$GeneID]
+  
+  tf_activities_CARNIVALinput<- tf_activities_stat %>%
+      as.data.frame() %>% 
+      tibble::rownames_to_column(var = "TF") 
+  write_csv(tf_activities_CARNIVALinput, 
+            file.path(path, "TFActivity_CARNIVALinput.csv"))
+  
+  tf_activities_counts <- 
+      dorothea::run_viper(Normalised_counts_matrix, regulons,
+      options =  list(minsize = 5, eset.filter = FALSE, 
+      cores = 1, verbose = FALSE, method = c("scale")))
+  
+  tf_activities_counts_filter <- tf_activities_counts %>% 
+      as.data.frame() %>% 
+      rownames_to_column(var = "GeneID") %>%
+      dplyr::filter(GeneID %in% tf_activities_stat_top25$GeneID) %>%
+      column_to_rownames(var = "GeneID") %>%
+      as.matrix()
+  tf_activities_vector <- as.vector(tf_activities_counts_filter)
+  
+  paletteLength <- 100
+  myColor <- 
+      colorRampPalette(c("darkblue", "whitesmoke","indianred"))(paletteLength)
+  
+  dorotheaBreaks <- c(seq(min(tf_activities_vector), 0, 
+      length.out=ceiling(paletteLength/2) + 1),
+      seq(max(tf_activities_vector)/paletteLength, 
+      max(tf_activities_vector), 
+      length.out=floor(paletteLength/2)))
+  
+  min_plot <- volcano_nice(as.data.frame(ttop_de[ttop_de$ID %in% targets_tf_min,]), 
+      FCIndex = 2, pValIndex = 5, IDIndex = 1,nlabels = 20, label = TRUE, 
+      straight = FALSE) + ggtitle(as.character(min_tf$GeneID))
+  
+  max_plot <- volcano_nice(as.data.frame(ttop_de[ttop_de$ID %in% targets_tf_max,]), 
+      FCIndex = 2, pValIndex = 5, IDIndex = 1,nlabels = 20, label = TRUE, 
+      straight = FALSE) + ggtitle(as.character(max_tf$GeneID))
+  
+  pdf(file.path(path, "TF.pdf"), onefile = TRUE)
+  print(plot.new() + text(.5, .5, 'TF analysis', cex=3))
+  print(pheatmap(tf_activities_counts_filter,
+      fontsize=14, fontsize_row = 8, fontsize_col = 8, 
+      color=myColor, breaks = dorotheaBreaks,
+      main = "Dorothea ABC", angle_col = 45,
+      treeheight_col = 0,  border_color = NA))
+  print(ggplot(tf_activities_stat_top25,aes(x = reorder(GeneID, NES), y = NES)) + 
+      geom_bar(aes(fill = NES), stat = "identity") +
+      scale_fill_gradient2(low = "darkblue", high = "indianred", 
+          mid = "whitesmoke", midpoint = 0) + 
+      theme_minimal() +
+      theme(axis.title = element_text(face = "bold", size = 12),
+          axis.text.x = 
+              element_text(angle = 45, hjust = 1, size =10, face= "bold"),
+          axis.text.y = element_text(size =10, face= "bold"),
+          panel.grid.major = element_blank(), 
+          panel.grid.minor = element_blank()) +
+      xlab("Transcription Factors"))
+  print(max_plot)
+  print(min_plot)
+  
+  dev.off()
+}
+
+merge_pdfs <- function(dir){
+  path <- file.path('..', 'results', dir)
+  pdfs <-  sapply(c('normalization.pdf', 'DE.pdf', 'pathway.pdf', 'TF.pdf'), 
+                  function(x){file.path(file.path(path), x)})
+  staple_pdf(
+    input_files = pdfs,
+    output_filepath = file.path(path, paste0(dir, '.pdf')),
+    overwrite = TRUE
+  )
+}
+```
+
+```{r, message=FALSE}
+# Condition
+msk <- meta$condition == 'CN'
+condition <- meta$treatment[msk]
+tdf <- df[,msk]
+dir <- 'control'
+run_normalize(tdf, condition, dir)
+run_de(dir)
+run_pathway(dir)
+run_tf(dir)
+merge_pdfs(dir)
+
+
+# Condition
+msk <- meta$condition == 'IN'
+condition <- meta$treatment[msk]
+tdf <- df[,msk]
+dir <- 'intervention'
+run_normalize(tdf, condition, dir)
+run_de(dir)
+run_pathway(dir)
+run_tf(dir)
+merge_pdfs(dir)
+
+# Condition
+msk <- meta$treatment == 'AT'
+condition <- meta$condition[msk]
+tdf <- df[,msk]
+dir <- 'control_vs_intervention'
+run_normalize(tdf, condition, dir)
+run_de(dir)
+run_pathway(dir)
+run_tf(dir)
+merge_pdfs(dir)
+```
+
