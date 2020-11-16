@@ -413,16 +413,77 @@ run_de(dir)
 run_pathway(dir)
 run_tf(dir)
 merge_pdfs(dir)
-
-# Condition
-msk <- meta$treatment == 'AT'
-condition <- meta$condition[msk]
-tdf <- df[,msk]
-dir <- 'control_vs_intervention'
-run_normalize(tdf, condition, dir)
-run_de(dir)
-run_pathway(dir)
-run_tf(dir)
-merge_pdfs(dir)
 ```
+
+```{r}
+# Comparison between CN vs IN
+cn_de <- read_csv(file.path('..', 'results', 'control', "ttop_de.csv"))
+rownames(cn_de) <- cn_de$ID
+in_de <- read_csv(file.path('..', 'results', 'intervention', "ttop_de.csv"))
+rownames(in_de) <- in_de$ID
+
+top_cn <- cn_de %>% filter(adj.P.Val < 0.05)
+top_in <- in_de %>% filter(adj.P.Val < 0.05)
+
+
+shared_genes <- intersect(top_cn$ID, top_in$ID)
+diff_logFC_shared <- top_in[shared_genes,]$logFC - top_cn[shared_genes,]$logFC
+
+uniq_cn <- setdiff(top_cn$ID, top_in$ID)
+uniq_in <- setdiff(top_in$ID, top_cn$ID)
+
+diff_logFC_uniq_cn <- abs(in_de[uniq_cn,]$logFC - cn_de[uniq_cn,]$logFC)
+diff_logFC_uniq_in <- abs(in_de[uniq_in,]$logFC - cn_de[uniq_in,]$logFC)
+
+str_de_cn <- uniq_cn[diff_logFC_uniq_cn > 0.25]
+str_de_in <- uniq_in[diff_logFC_uniq_in > 0.25]
+```
+
+
+```{r}
+uniqs <- c(uniq_cn[order(diff_logFC_uniq_cn, decreasing = T)], 
+           uniq_in[order(diff_logFC_uniq_in, decreasing = F)])
+
+x <- c(uniqs, uniqs)
+labels <- c(rep("Control", length(uniqs)), rep("Intervention", length(uniqs)))
+
+data <- data_frame(X=x, 
+                    Y=labels)
+data$Z <- c(cn_de[uniqs,]$logFC, in_de[uniqs,]$logFC)
+ 
+# Heatmap 
+ggplot(data, aes(X, Y, fill= Z)) + 
+  geom_tile() + theme(axis.text.x=element_text(angle=90, hjust=1))
+```
+
+
+
+```{r}
+ggplot(data=data, aes(x=X, y=Z, fill=Y)) +
+  geom_bar(stat="identity", position=position_dodge())+
+  geom_text(aes(label=Y), vjust=1.6, color="white",
+            position = position_dodge(0.9), size=3.5)+
+  scale_fill_brewer(palette="Paired")+
+  theme_minimal()
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
