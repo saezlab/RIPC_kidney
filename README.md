@@ -1,2 +1,4 @@
-# kidney_transplant_hannes
-RNA-seq analysis of Kidney transplant samples
+# RIPC kidney
+Scripts to reproduce the results from the manuscript "Defining the molecular
+response to ischemia-reperfusion injury and remote ischemic preconditioning in
+human kidney transplantation".

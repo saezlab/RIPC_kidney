@@ -1,0 +1,818 @@
+---
+title: "Figures"
+author: "Pau Badia i Mompel"
+date: "01/02/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+```
+
+```{r include=F, warning=F}
+library(readxl)
+library(ggplot2)
+library(ggplotify)
+library(patchwork)
+library(reshape)
+library(vsn)
+library(limma)
+#library(progeny)
+library(decoupleR)
+library(ggrepel)
+library(tidyverse)
+library(pheatmap)
+library(ggrepel)
+library(ggvenn)
+```
+
+```{r, echo=FALSE}
+# Process data before analyses
+
+# Read logCPM counts
+expr <- read.csv(file.path('data', 'post_pre_logCPM.csv')) %>%
+  as_tibble() %>%
+  filter(`symbol` != '') %>%
+  filter(!str_detect(`symbol`, ',')) %>%
+  dplyr::distinct(`symbol`, .keep_all = T) %>%
+  dplyr::select(-ensembl, -entrez, -length) %>%
+  column_to_rownames('symbol') %>%
+  as.matrix()
+# Remove genes with negative values (very low expression)
+expr <- expr[rowSums(expr < 0) == 0,]
+
+# Generate condition df
+conds <- map(colnames(expr), function(name){stringr::str_split(name, '_')[[1]][[1]]}) %>% unlist()
+colnames(expr) <- gsub('[_d]', '', colnames(expr))
+conds <- data.frame(sample_id=colnames(expr), treatment=conds) %>% column_to_rownames('sample_id') %>%
+  dplyr::mutate(treatment=factor(treatment, level=c('pre','post')))
+
+# Filter out genes from DEA
+deg <- read.csv(file.path('data', 'DiffGeneExpAnalysis_cpm1_3_voom.csv')) %>%
+  as_tibble() %>%
+  filter(ID != '') %>%
+  filter(!str_detect(ID, ',')) %>%
+  dplyr::distinct(ID, .keep_all = T) %>%
+  filter(ID %in% rownames(expr))
+write.csv(deg, file.path('results', 'deg_voom.csv'), row.names=F)
+
+# Write Supp1
+supp1 <- deg %>%
+  dplyr::filter(adj.P.Val < 0.05, abs(logFC) > 1.5, AveExpr > 0, ID %in% rownames(expr)) %>%
+  dplyr::arrange(.data$adj.P.Val)
+write.csv(supp1, file.path('figures', 'supp1.csv'), row.names=F)
+
+de_genes <- supp1 %>%
+  pull(ID)
+
+jci_tfs <- read.csv(file.path('data', 'jci_tfs.csv'), skip=1) %>%
+  as_tibble() %>%
+  select(gene, final_score) %>%
+  column_to_rownames('gene')
+```
+
+# Figure 2
+## PCA
+
+```{r, echo=F}
+PCA <- prcomp(t(expr), scale=T)
+coords <- PCA$x[,1:2] %>% 
+  as_tibble(rownames = 'sample_id') %>% 
+  mutate(treatment=conds[sample_id,])
+
+perc_var_explained <- unname(summary(PCA)[["importance"]][, c('PC2')]['Cumulative Proportion'])
+
+pca_plot <- ggplot(coords, aes(x=PC1, y=PC2, color=treatment, label=sample_id)) +
+  geom_point() +
+  geom_text_repel(show.legend = FALSE) + 
+  ggtitle(stringr::str_glue('% variance explained: {perc_var_explained}')) +
+  theme_bw() + theme(legend.position="bottom")
+
+# Save
+pdf(file = file.path('figures', 'fig2_b.pdf'),
+    width = 4, # The width of the plot in inches
+    height = 4) # The height of the plot in inches
+pca_plot
+dev.off()
+```
+## DEG
+
+```{r, echo=F}
+sign_deg <- supp1 %>%
+  head(50) %>%
+  dplyr::pull(ID)
+
+annotation_row <- dplyr::mutate(conds, treatment=factor(treatment, level=c('post','pre')))
+deg_heatmap <- as.ggplot(pheatmap(t(expr[sign_deg,]), annotation_row = annotation_row), silent=T)
+
+# Save
+pdf(file = file.path('figures', 'fig2_a.pdf'),
+    width = 10, # The width of the plot in inches
+    height = 5) # The height of the plot in inches
+deg_heatmap
+dev.off()
+```
+## TF and Pathway activities
+```{r, echo=F, message=F, warning=F}
+read_deg <- function(deg_path){
+  deg <- read.csv(deg_path) %>%
+      dplyr::select(ID, t) %>% 
+      dplyr::filter(!is.na(t)) %>% 
+      column_to_rownames(var = "ID") %>%
+      as.matrix()
+  return(deg)
+}
+
+get_pathway_acts <- function(deg_path, top=100){
+  deg <- read_deg(deg_path)
+  model <- decoupleR::get_progeny(organism = 'Human', top=top)
+  PathwayActivity_zscore <- decoupleR::run_mlm(deg, model, .mor = weight) %>%
+    select(source, score) %>%
+    arrange(score) %>%
+    dplyr::mutate(source = factor(source)) %>%
+    dplyr::rename(Pathway=source)
+  PathwayActivity_zscore
+}
+
+plot_scores <- function(act_df){
+  ggplot(act_df, aes(x = reorder(Pathway, score), y = score)) + 
+    geom_bar(aes(fill = score), stat = "identity") +
+    scale_fill_gradient2(low = "darkblue", high = "indianred", 
+        mid = "whitesmoke", midpoint = 0) + 
+    theme_minimal() +
+    theme(axis.title = element_text(face = "bold", size = 12),
+        axis.text.x = 
+            element_text(angle = 45, hjust = 1, size =10, face= "bold"),
+        axis.text.y = element_text(size =10, face= "bold"),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank()) +
+    xlab("Pathways")
+}
+
+#plot_pathway_weights <- function(deg_path, pathway, top = 100){
+#  deg <- read.csv(deg_path) %>%
+#    dplyr::select(ID, t) %>% 
+#      dplyr::filter(!is.na(t)) %>% 
+#      column_to_rownames(var = "ID") %>%
+#      as.matrix()
+#  prog_matrix <- getModel("Human", top=top) %>% 
+#    as.data.frame()  %>%
+#    tibble::rownames_to_column("GeneID")
+#  deg_tibl <- deg %>% 
+#    as.data.frame() %>% 
+#    tibble::rownames_to_column("GeneID")
+#  scat_plots <- progeny::progenyScatter(df = deg_tibl, 
+#    weight_matrix = prog_matrix, 
+#    statName = "t_values", verbose = FALSE)
+#  return(scat_plots[[1]][[pathway]])
+#}
+
+get_tf_acts <- function(deg_path){
+  deg <- read_deg(deg_path)
+  net <- decoupleR::get_dorothea()
+  data(dorothea_hs, package = "dorothea")
+  net <- dorothea_hs %>%
+    dplyr::filter(confidence %in% c("A", "B","C")) %>%
+    rename(source=tf)
+  decoupleR::run_mlm(deg, net, .mor = mor) %>%
+    select(source, score) %>%
+    arrange(score) %>%
+    dplyr::mutate(source = factor(source)) %>%
+    column_to_rownames('source')
+}
+
+plot_scores_tf <- function(act_df, top=25){
+  tf_activities_stat_top <- act_df %>%
+    as.data.frame() %>% 
+    rownames_to_column(var = "GeneID") %>%
+    dplyr::top_n(top, wt = abs(score)) %>%
+    dplyr::arrange(score) %>% 
+    dplyr::mutate(GeneID = factor(GeneID))
+  
+  plt <- ggplot(tf_activities_stat_top,aes(x = reorder(GeneID, score), y = score)) + 
+    geom_bar(aes(fill = score), stat = "identity") +
+    scale_fill_gradient2(low = "darkblue", high = "indianred", 
+        mid = "whitesmoke", midpoint = 0) + 
+    theme_minimal() +
+    theme(axis.title = element_text(face = "bold", size = 12),
+        axis.text.x = 
+            element_text(angle = 45, hjust = 1, size =10, face= "bold"),
+        axis.text.y = element_text(size =10, face= "bold"),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank()) +
+    xlab("Transcription Factors")
+  return(plt)
+}
+
+volcano_nice <- function (df, hAss = 0.05, FCIndex, pValIndex, IDIndex, vAss = NULL,
+                          label = FALSE, straight = FALSE, nlabels, manual_labels = NA)
+{
+  df <- df[complete.cases(df), ]
+  names(df)[1] <- "X1"
+  hAssOri <- hAss
+  hAss <- -log(hAss)
+  names(df) <- gsub("adj.P.Val", "FDR", names(df))
+  names(df)[FCIndex] <- "logFC"
+  names(df)[pValIndex] <- "adj.P.Val"
+  if (max(abs(df[, FCIndex])) >= 1) {
+    xlimAbs <- ceiling(max(abs(df[, FCIndex])))
+    ylimAbs <- ceiling(max(abs(-log(df[, pValIndex]))))
+  }
+  else {
+    xlimAbs <- max(abs(df[, FCIndex]))
+    ylimAbs <- max(abs(-log(df[, pValIndex])))
+  }
+  if (is.null(vAss)) {
+    vAss <- xlimAbs/10
+  }
+  xneg <- function(x) abs(hAss - 1 + x/(x + vAss))
+  xpos <- function(x) abs(hAss - 1 + x/(x - vAss))
+  test <- function(x, y, vAss) {
+    if (x < -vAss) {
+      if (xneg(x) < -log(y)) {
+        return("1")
+      }
+      else {
+        return("0")
+      }
+    }
+    else {
+      if (x > vAss) {
+        if (xpos(x) < -log(y)) {
+          return("1")
+        }
+        else {
+          return("0")
+        }
+      }
+      else {
+        return("0")
+      }
+    }
+  }
+  if (straight) {
+    df$couleur <- ifelse(abs(df$logFC) >= vAss & df$adj.P.Val <=
+                           hAssOri, "1", "0")
+  }
+  else {
+    df$couleur <- "0"
+    df$couleur <- apply(df, 1, FUN = function(x) test(as.numeric(x[FCIndex]),
+                                                      as.numeric(x[pValIndex]), vAss))
+  }
+  df <- df[order(df$adj.P.Val, decreasing = F), ]
+  df$condLabel <- df[, IDIndex]
+  df[df$couleur == "0", "condLabel"] <- NA
+  labels_to_keep <- c(df[c(1:nlabels), "condLabel"],manual_labels)
+  df[!(df$condLabel %in% labels_to_keep), "condLabel"] <- NA
+  df$couleur <- ifelse(df$couleur == "1" & df$logFC < 0, "2",
+                       df$couleur)
+  if (label) {
+    a <- ggplot(df, aes(x = logFC, y = -log(adj.P.Val), color = couleur)) +
+      geom_point(alpha = 0.5) + geom_label_repel(aes(label = condLabel)) +
+      stat_function(fun = xneg, xlim = c(-xlimAbs, -vAss),
+                    color = "black", alpha = 0.7) + ylim(c(0, ylimAbs)) +
+      xlim(c(-xlimAbs, xlimAbs)) + stat_function(fun = xpos,
+                                                 xlim = c(vAss, xlimAbs), color = "black", alpha = 0.7) +
+      scale_colour_manual(values = c("grey30", "red",
+                                     "royalblue3")) + theme_minimal() + theme(legend.position = "none")
+  }
+  else {
+    if (straight) {
+      a <- ggplot(df, aes(x = logFC, y = -log(adj.P.Val),
+                          color = couleur)) + geom_point(alpha = 0.5) +
+        geom_vline(xintercept = -vAss, color = "blue") +
+        geom_vline(xintercept = vAss, color = "blue") +
+        ylim(c(0, ylimAbs)) + xlim(c(-xlimAbs, xlimAbs)) +
+        geom_hline(yintercept = hAss, color = "red") +
+        scale_colour_manual(values = c("grey30", "red",
+                                       "royalblue3")) + theme_minimal() + theme(legend.position = "none")
+    }
+    else {
+      a <- ggplot(df, aes(x = logFC, y = -log(adj.P.Val),
+                          color = couleur)) + geom_point(alpha = 0.5) +
+        stat_function(fun = xneg, xlim = c(-xlimAbs,
+                                           -vAss), color = "black", alpha = 0.7) + ylim(c(0,
+                                                                                          ylimAbs)) + xlim(c(-xlimAbs, xlimAbs)) + stat_function(fun = xpos,
+                                                                                                                                                 xlim = c(vAss, xlimAbs), color = "black", alpha = 0.7) +
+        scale_colour_manual(values = c("grey30", "red",
+                                       "royalblue3")) + theme_minimal() + theme(legend.position = "none")
+    }
+  }
+  return(a)
+}
+
+plot_TF_weights <- function(deg_path, tf_name){
+  deg <- read.csv(deg_path)
+  targets <- regulons$target[regulons$source == tf_name]
+  print(as.data.frame(deg[deg$ID %in% targets,]))
+  volcano_nice(as.data.frame(deg[deg$ID %in% targets,]),
+    FCIndex = 3, pValIndex = 5, IDIndex = 1, nlabels = 20, label = TRUE, 
+    straight = FALSE) + ggtitle(tf_name)
+}
+
+deg_path <- file.path('results', 'deg_voom.csv')
+pwacts <- get_pathway_acts(deg_path = deg_path)
+tfacts <- get_tf_acts(deg_path = deg_path)
+
+# Save
+pdf(file = file.path('figures', 'fig2_c.pdf'),
+    width = 5, # The width of the plot in inches
+    height = 4) # The height of the plot in inches
+plot_scores_tf(tfacts, top=20)
+dev.off()
+
+# Save
+pdf(file = file.path('figures', 'fig2_d.pdf'),
+    width = 5, # The width of the plot in inches
+    height = 4) # The height of the plot in inches
+plot_scores(pwacts)
+dev.off()
+
+```
+
+## Overlap with previous study
+```{r}
+jci_deg <- read.csv(file.path('data', 'jci_deg.csv'), skip=2) %>%
+  as_tibble() %>%
+  filter(Human.specific != '') %>%
+  pull(Human.specific)
+
+jci_deg <- read.csv(file.path('data', 'jci_deg.csv'), skip=2) %>%
+  as_tibble() %>%
+  filter(Shared != '') %>%
+  pull(Shared) %>%
+  c(., jci_deg)
+
+x <- list(
+  IRI = de_genes,
+  JCI = jci_deg
+  )
+venn <- ggvenn(x)
+
+# Write Supp table 2
+deg_iri_spec <- setdiff(de_genes, jci_deg)
+deg_inter <- intersect(de_genes, jci_deg)
+deg_jci_spec <- setdiff(jci_deg, de_genes)
+supp2 <- tibble::lst(deg_iri_spec, deg_jci_spec, deg_inter)
+supp2 <- as_tibble(data.frame(lapply(supp2, `length<-`, max(lengths(supp2)))))
+colnames(supp2) <- c('IRI.specific', 'JCI.specific', 'Shared')
+write.csv(supp2, file.path('figures', 'supp2.csv'), row.names=F)
+
+# Save
+pdf(file = file.path('figures', 'fig2_e.pdf'),
+    width = 4, # The width of the plot in inches
+    height = 4) # The height of the plot in inches
+venn
+dev.off()
+```
+
+# Figure 3
+```{r}
+# Load xlsl file, skip metadata header
+df <- read_excel("data/data.xlsx", skip = 1, col_names = FALSE)[,c(1:25, 85)]
+
+meta <- df[1:6,1:25] %>% t()
+colnames(meta) <- meta[1,]
+meta <- meta[-1,] #Remove rownames
+meta <- meta %>% as_tibble() %>% select(pair, treatment, condition)
+
+# Format changes
+meta <- meta %>% 
+  mutate(pair=toupper(pair), 
+         treatment=ifelse(treatment == 'Baseline', 'BT', 'AT'),
+         condition=ifelse(condition == 'Kontroll', 'CN', 'IN')) %>%
+  tidyr::unite(sample, condition, treatment, pair, sep = "_", remove = FALSE)
+
+# Remove header from table
+df <- df[8:nrow(df),]
+
+# Make unique genes and transform to mat
+df <- df %>%
+  distinct(`...85`, .keep_all = T) %>%
+  select(-`...1`) %>%
+  column_to_rownames('...85')
+gene_names <- rownames(df)
+df <- data.frame(sapply(df, function(x) as.numeric(x)))
+colnames(df) <- meta$sample
+rownames(df) <- gene_names
+
+#We remove rows that contain only 0
+df <- df[rowSums(df) > 0,]
+#remaining 0 have to be made as NA so that log2 transformation is possible
+df[df == 0] <- NA
+# Trim violin plots
+df[log2(df) < 4 ] <- NA
+# Remove rows (genes) which aren't well-measured in enough samples
+df <- df[rowSums(is.na(df)) < 2,]
+
+# Train vsn parameters
+fit <- vsnMatrix(as.matrix(df))
+count_df_vsn <- as.data.frame(vsn::predict(fit,as.matrix(df)))
+#count_df_vsn[is.na(count_df_vsn)] <- 0
+
+# Build DEG
+TS <- paste(meta$condition, meta$treatment, sep=".")
+TS <- factor(TS, levels=c("CN.BT", "CN.AT", "IN.BT", "IN.AT"))
+design <- model.matrix(~0+TS)
+colnames(design) <- levels(TS)
+fit <- lmFit(count_df_vsn, design)
+
+cont.matrix <- makeContrasts(
+  CNATvsCNBT=CN.AT-CN.BT,
+  INATvsINBT=IN.AT-IN.BT,
+  Diff=(IN.AT-IN.BT)-(CN.AT-CN.BT),
+  levels=design)
+fit2 <- contrasts.fit(fit, cont.matrix)
+fit2 <- eBayes(fit2)
+```
+
+## Heatmap
+```{r}
+# Extract DEG for the diff contrast
+deg_diff <- topTable(fit2, coef="Diff", adjust="BH", number = Inf) %>%
+  arrange(P.Value) %>% 
+  rownames_to_column('ID')
+write.csv(deg_diff, file.path('results', 'deg_limma.csv'), row.names=F)
+
+deg_control <- topTable(fit2, coef="CNATvsCNBT", adjust="BH", number = Inf) %>%
+  arrange(P.Value) %>% 
+  rownames_to_column('ID')
+deg_interv <- topTable(fit2, coef="INATvsINBT", adjust="BH", number = Inf) %>%
+  arrange(P.Value) %>% 
+  rownames_to_column('ID')
+
+# Plot heatmap top deg
+top_deg <- deg_diff %>%
+  head(10) %>%
+  dplyr::pull(ID)
+
+annotation_col <- meta %>%
+  column_to_rownames('sample') %>%
+  select(condition) %>%
+  dplyr::mutate(condition=factor(condition, level=c('CN','IN')))
+deg_heatmap <- as.ggplot(pheatmap(count_df_vsn[top_deg,], annotation_col = annotation_col), silent=T)
+
+# Save
+pdf(file = file.path('figures', 'fig3_c.pdf'),
+    width = 10, # The width of the plot in inches
+    height = 5) # The height of the plot in inches
+deg_heatmap
+dev.off()
+```
+
+## TF and Pathways
+```{r}
+deg_path <- file.path('results', 'deg_limma.csv')
+pwacts <- get_pathway_acts(deg_path = deg_path)
+tfacts <- get_tf_acts(deg_path = deg_path)
+
+# Save
+pdf(file = file.path('figures', 'fig3_d.pdf'),
+    width = 5, # The width of the plot in inches
+    height = 4) # The height of the plot in inches
+plot_scores_tf(tfacts, top=20)
+dev.off()
+
+# Save
+pdf(file = file.path('figures', 'fig3_e.pdf'),
+    width = 5, # The width of the plot in inches
+    height = 4) # The height of the plot in inches
+plot_scores(pwacts)
+dev.off()
+```
+
+## Volcano plots targets JAK-STAT
+```{r}
+plot_weights <- function(deg, network, name){
+  targets <- network$target[network$source == name]
+  volcano_nice(deg[deg$ID %in% targets,],
+    FCIndex = 2, pValIndex = 5, IDIndex = 1, nlabels = 20, label = TRUE, 
+    straight = FALSE) + ggtitle(name)
+}
+
+model <- decoupleR::get_progeny(organism = 'Human', top=100)
+
+pdf(file = file.path('figures', 'fig3_f.pdf'),
+    width = 4, # The width of the plot in inches
+    height = 4) # The height of the plot in inches
+plot_weights(deg_control, model, 'JAK-STAT') + ggtitle('Control')
+dev.off()
+
+pdf(file = file.path('figures', 'fig3_g.pdf'),
+    width = 4, # The width of the plot in inches
+    height = 4) # The height of the plot in inches
+plot_weights(deg_interv, model, 'JAK-STAT') + ggtitle('Intervention')
+dev.off()
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```{r}
+
+sadafasdg
+
+pre_deg <- read.csv(file.path('results', 'deg_IRIvsBinK.csv')) %>%
+  as_tibble() %>%
+  filter(ID != '') %>%
+  filter(!str_detect(ID, ',')) %>%
+  dplyr::distinct(ID, .keep_all = T) %>%
+  dplyr::filter(adj.P.Val < 0.05, abs(logFC) > 1.0, AveExpr > 0) %>%
+  pull(ID)
+
+inter <- intersect(intersect(de_genes, jci_deg), pre_deg)
+
+x <- list(
+  Baseline = de_genes,
+  JCI = jci_deg,
+  Pre = pre_deg
+  )
+venn <- ggvenn(x)
+
+write.csv(data.frame(shared_genes=inter), 'shared_genes.csv', row.names = F)
+```
+
+```{r, echo=F, message=F, warning=F}
+inter <- intersect(rownames(tfacts), rownames(jci_tfs))
+joint_tfs <- tibble(names=inter, jci=jci_tfs[inter,], acts=abs(tfacts[inter,]))
+
+cor_val <- cor(joint_tfs[['jci']], joint_tfs[['acts']])
+corr <- ggplot(joint_tfs, aes(x=jci, y=acts, label=names)) +
+  geom_point() +
+  geom_text_repel() + 
+  ggtitle(stringr::str_glue('Correlation: {cor_val}')) +
+  theme_bw()
+```
+
+```{r, echo=F, message=F, warning=F}
+jun <- plot_TF_weights(deg_path, 'JUN')
+atf3 <- plot_TF_weights(deg_path, 'ATF3')
+```
+
+```{r}
+# Merge together and save
+pdf(file = file.path('.', 'fig_3.pdf'),
+    width = 10, # The width of the plot in inches
+    height = 10) # The height of the plot in inches
+(venn + corr) / (atf3 + jun)
+dev.off()
+```
+
+
+```{r}
+# Load xlsl file, skip metadata header
+df <- read_excel("data/data.xlsx", skip = 1, col_names = FALSE)[,1:25]
+
+meta <- df[1:6,1:25] %>% t()
+colnames(meta) <- meta[1,]
+meta <- meta[-1,] #Remove rownames
+meta <- meta %>% as_tibble() %>% select(pair, treatment, condition)
+# Format changes
+meta <- meta %>% 
+  mutate(pair=toupper(pair), 
+         treatment=ifelse(treatment == 'Baseline', 'BT', 'AT'),
+         condition=ifelse(condition == 'Kontroll', 'CN', 'IN')) %>%
+  tidyr::unite(sample, condition, treatment, pair, sep = "_", remove = FALSE)
+
+# Remove header from table
+df <- df[8:nrow(df),]
+
+# Select gene ids and remove column
+gene_ids <- df['...1'] %>% t()
+df <- df[,-1]
+
+# Transform to numeric df
+df <- data.frame(sapply(df, function(x) as.numeric(x)))
+
+# Name cols and rows
+rownames(df) <- gene_ids
+colnames(df) <- meta$sample
+
+#We remove rows that contain only 0
+df <- df[rowSums(df) > 0,]
+#remaining 0 have to be made as NA so that log2 transformation is possible
+df[df == 0] <- NA
+# Trim violin plots
+df[log2(df) < 4 ] <- NA
+# Remove rows (genes) which aren't well-measured in enough samples
+df <- df[rowSums(is.na(df)) < 2,]
+#now we can normalise the cleaned dataframe using vsn
+fit <- vsnMatrix(as.matrix(df)) #train vsn parameters
+count_df_vsn <- as.data.frame(vsn::predict(fit,as.matrix(df)))
+# Transform gene ids to gene symbols
+path <- file.path("data")
+gene_id_symbol <- 
+  read.csv(file.path(path, "gene_id_symbol.csv"), header = TRUE)
+rownames(gene_id_symbol) <- gene_id_symbol$id
+
+#remove all genes that have no gene symbol from our count dataframe
+count_df_vsn <- count_df_vsn[row.names(count_df_vsn) %in% 
+                               rownames(gene_id_symbol),]
+gene_id_symbol <- gene_id_symbol[rownames(gene_id_symbol) %in% 
+                                   row.names(count_df_vsn),]
+
+# Mean duplicates
+repeated_symbols <- gene_id_symbol %>% group_by(symbol) %>% 
+  summarise(count=n()) %>% arrange(desc(count)) %>% filter(count > 1) %>% 
+  select(symbol) %>% t() %>% unname() %>% c()
+
+for(r in repeated_symbols){
+  # Get repeated ids
+  repeated_ids <- gene_id_symbol %>% 
+    filter(symbol==r) %>% rownames()
+  # Compute mean expression
+  mean_r <- count_df_vsn[repeated_ids,] %>% 
+    summarise(across(everything(), list(mean)))
+  # Update symbol with mean expression
+  count_df_vsn[r,] <- mean_r
+  
+  # Remove ids
+  count_df_vsn <- count_df_vsn[!row.names(count_df_vsn) %in% repeated_ids,]
+}
+
+#now let's convert ids with the pseudo dictionary
+for(i in 1:length(count_df_vsn[,1]))
+{
+  if (!row.names(count_df_vsn)[i] %in% repeated_symbols){
+    row.names(count_df_vsn)[i] <- 
+      gene_id_symbol[row.names(count_df_vsn)[i],]$symbol
+  }
+}
+
+
+library(limma)
+count_df_vsn[is.na(count_df_vsn)] <- 0
+TS <- paste(meta$condition, meta$treatment, sep=".")
+TS <- factor(TS, levels=c("CN.BT", "CN.AT", "IN.BT", "IN.AT"))
+design <- model.matrix(~0+TS)
+colnames(design) <- levels(TS)
+fit <- lmFit(count_df_vsn, design)
+
+cont.matrix <- makeContrasts(
+  CNATvsCNBT=CN.AT-CN.BT,
+  INATvsINBT=IN.AT-IN.BT,
+  Diff=(IN.AT-IN.BT)-(CN.AT-CN.BT),
+  levels=design)
+fit2 <- contrasts.fit(fit, cont.matrix)
+fit2 <- eBayes(fit2)
+deg <- as.matrix(fit2[["t"]])
+
+deg_control <- tibble(
+  ID = rownames(fit2[["t"]]),
+  logFC = fit2[["coefficients"]][,'CNATvsCNBT'],
+  pval = fit2[["p.value"]][,'CNATvsCNBT'],
+)
+
+deg_interv <- tibble(
+  ID = rownames(fit2[["t"]]),
+  logFC = fit2[["coefficients"]][,'INATvsINBT'],
+  pval = fit2[["p.value"]][,'INATvsINBT'],
+)
+
+deg_diff <- tibble(
+  ID = rownames(fit2[["t"]]),
+  logFC = fit2[["coefficients"]][,'Diff'],
+  pval = fit2[["p.value"]][,'Diff'],
+)
+
+tfs_acts <- decoupleR::run_mlm(deg, network = regulons)
+model <- progeny::getModel(organism = 'Human', top=100) %>% 
+    rownames_to_column('gene') %>% 
+    as_tibble() %>% 
+    pivot_longer(cols = -gene) %>% 
+    filter(value != 0) %>%
+    dplyr::rename(target=gene, source=name, mor=value) %>%
+    select(source, target, mor)
+
+pws_acts <- decoupleR::run_mlm(deg, network = model)
+
+tf_control <- tfs_acts %>%
+  filter(condition=='CNATvsCNBT') %>%
+  select(source, score) %>%
+  column_to_rownames('source') %>%
+  arrange(score) %>%
+  as.matrix()
+
+tf_interv <- tfs_acts %>%
+  filter(condition=='INATvsINBT') %>%
+  select(source, score) %>%
+  column_to_rownames('source') %>%
+  arrange(score) %>%
+  as.matrix()
+
+tf_diff <- tfs_acts %>%
+  filter(condition=='Diff') %>%
+  select(source, score) %>%
+  column_to_rownames('source') %>%
+  arrange(score) %>%
+  as.matrix()
+
+pw_control <- pws_acts %>%
+  filter(condition=='CNATvsCNBT') %>%
+  select(source, score) %>%
+  column_to_rownames('source') %>%
+  arrange(score) %>%
+  as.matrix()
+
+pw_interv <- pws_acts %>%
+  filter(condition=='INATvsINBT') %>%
+  select(source, score) %>%
+  column_to_rownames('source') %>%
+  arrange(score) %>%
+  as.matrix()
+
+pw_diff <- pws_acts %>%
+  filter(condition=='Diff') %>%
+  select(source, score) %>%
+  column_to_rownames('source') %>%
+  arrange(score) %>%
+  as.matrix()
+
+plot_scores_tf(tf_control, top=10)+plot_scores_tf(tf_interv, top=10)+plot_scores_tf(tf_diff, top=10)+plot_layout(guides = 'collect')
+plot_scores_tf(pw_control, top=14)+plot_scores_tf(pw_interv, top=14)+plot_scores_tf(pw_diff, top=14)+plot_layout(guides = 'collect')
+
+plot_weights <- function(deg, network, name){
+  targets <- network$target[network$source == name]
+  volcano_nice(as.data.frame(deg[deg$ID %in% targets,]),
+    FCIndex = 2, pValIndex = 3, IDIndex = 1, nlabels = 20, label = TRUE, 
+    straight = FALSE) + ggtitle(name)
+}
+
+
+(plot_weights(deg_control, regulons, 'FOXP1') + plot_weights(deg_interv, regulons, 'FOXP1')) /
+  (plot_weights(deg_control, regulons, 'ONECUT1') + plot_weights(deg_interv, regulons, 'ONECUT1')) /
+(plot_weights(deg_control, model, 'JAK-STAT') + plot_weights(deg_interv, model, 'JAK-STAT')) /
+  (plot_weights(deg_control, model, 'EGFR') + plot_weights(deg_interv, model, 'EGFR'))
+
+
+# Merge together and save
+pdf(file = file.path('.', 'fig_4_a.pdf'),
+    width = 10, # The width of the plot in inches
+    height = 10) # The height of the plot in inches
+(plot_scores_tf(tf_control, top=10)+plot_scores_tf(tf_interv, top=10)+plot_scores_tf(tf_diff, top=10)) /
+(plot_scores_tf(pw_control, top=14)+plot_scores_tf(pw_interv, top=14)+plot_scores_tf(pw_diff, top=14))+plot_layout(guides = 'collect')
+dev.off()
+
+# Merge together and save
+pdf(file = file.path('.', 'fig_4_b.pdf'),
+    width = 10, # The width of the plot in inches
+    height = 10) # The height of the plot in inches
+(plot_weights(deg_control, regulons, 'FOXP1') + plot_weights(deg_interv, regulons, 'FOXP1')) /
+  (plot_weights(deg_control, regulons, 'ONECUT1') + plot_weights(deg_interv, regulons, 'ONECUT1')) /
+(plot_weights(deg_control, model, 'JAK-STAT') + plot_weights(deg_interv, model, 'JAK-STAT')) /
+  (plot_weights(deg_control, model, 'EGFR') + plot_weights(deg_interv, model, 'EGFR'))
+dev.off()
+```
+```{r}
+sign_deg <- deg_diff %>%
+  dplyr::filter(pval < 0.05, abs(logFC) > 0.3, ID %in% rownames(count_df_vsn)) %>%
+  dplyr::arrange(-abs(logFC)) %>%
+  head(10) %>%
+  dplyr::pull(ID)
+
+annot <- tibble(names = colnames(count_df_vsn), treatment = TS) %>% 
+  column_to_rownames('names') %>%
+  mutate(treatment = as.character(TS)) %>%
+  mutate(treatment = if_else(grepl('CN', treatment), 'Control', 'Intervention')) %>%
+  mutate(treatment = factor(treatment, levels = c('Control', 'Intervention')))
+
+deg_heatmap <- as.ggplot(pheatmap(as.matrix(count_df_vsn[sign_deg,]), 
+                                  annotation_col = annot,
+                                  silent=T
+                         ))
+
+# Merge together and save
+
+plot_scores_tf(tf_diff, top=10) + plot_scores_tf(pw_diff, top=14)
+
+
+
+p1 <- plot_weights(deg_control, model, 'JAK-STAT') + xlim(-2,2) + ylim(0,6.5) + ggtitle('Control')
+p2 <- plot_weights(deg_interv, model, 'JAK-STAT') + xlim(-2,2) + ylim(0,6.5) + ggtitle('Intervention')
+p1 + p2
+
+```
+
+
+
+
+Pathway and Transcription Factor activities were inferred using the PROGENy gene weights and the gene regulatory network DoRoTHeA, respectively, both coupled with the Multivariate Linear Model method implemented in decoupleR. The activity scores showed are the t-values from the fitted models.
+
+Badia-i-Mompel, P. et al. decoupleR: Ensemble of computational methods to infer biological activities from omics data. bioRxiv 2021.11.04.467271 (2021) doi:10.1101/2021.11.04.467271.
+Schubert, M. et al. Perturbation-response genes reveal signaling footprints in cancer gene expression. Nat. Commun. 9, 1–11 (2018).
+Garcia-Alonso, L., Holland, C. H., Ibrahim, M. M., Turei, D. & Saez-Rodriguez, J. Benchmark and integration of resources for the estimation of human transcription factor activities. Genome Res. 29, 1363–1375 (2019).
+
+
+
